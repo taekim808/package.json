@@ -1,28 +1,27 @@
-// Minimal Shopify App Proxy + Standing Orders job
-// Env vars required (set on Render):
-//   SHOP=fzn6nu-3j.myshopify.com
-//   ADMIN_ACCESS_TOKEN=***
-//   APP_PROXY_SHARED_SECRET=***
-// Optional: PORT (Render sets this)
+// Minimal Shopify App Proxy + Standing Orders backend (ESM)
+// Comments in English only.
 
+// Import deps (ESM style, matches "type": "module" in package.json)
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
 
-const express = require("express");
+// App + JSON
 const app = express();
+app.use(express.json());
 
+// Root route so Shopify Admin can load your app without "Cannot GET /"
 app.get("/", (_req, res) => {
   res.send("Standing Order App backend is running ✅");
 });
 
-app.use(express.json());
+// Health check for quick testing
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, shop: process.env.SHOP || "(missing SHOP env var)" });
+});
 
-// ---- Helpers
+// ---- ENV + helpers
 const { SHOP, ADMIN_ACCESS_TOKEN, APP_PROXY_SHARED_SECRET } = process.env;
-if (!SHOP) console.warn("WARN: SHOP env var not set");
-if (!ADMIN_ACCESS_TOKEN) console.warn("WARN: ADMIN_ACCESS_TOKEN env var not set");
-if (!APP_PROXY_SHARED_SECRET) console.warn("WARN: APP_PROXY_SHARED_SECRET env var not set");
 
 async function shopify(path, init = {}) {
   const url = `https://${SHOP}/admin/api/2024-10${path}`;
@@ -41,9 +40,8 @@ async function shopify(path, init = {}) {
   return res.json();
 }
 
-// HMAC verify for App Proxy (signature query param)
+// Verify App Proxy signature (?signature=...)
 function verifyProxy(req) {
-  // Shopify sends ?signature=... and other query params; we must rebuild the string
   const { signature, ...params } = req.query;
   if (!signature) return false;
   const sorted = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('');
@@ -55,12 +53,7 @@ function verifyProxy(req) {
   }
 }
 
-// ---- Health (for easy testing directly)
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, shop: SHOP });
-});
-
-// ---- App Proxy: load saved standing orders for a customer
+// ===== App Proxy: load existing standing orders for a customer
 app.get("/proxy/standing-orders", async (req, res) => {
   try {
     if (!verifyProxy(req)) return res.status(401).json({ error: "invalid signature" });
@@ -75,7 +68,7 @@ app.get("/proxy/standing-orders", async (req, res) => {
   }
 });
 
-// ---- App Proxy: save standing orders JSON for a customer
+// ===== App Proxy: save standing orders JSON for a customer
 app.post("/proxy/standing-orders", async (req, res) => {
   try {
     if (!verifyProxy(req)) return res.status(401).json({ error: "invalid signature" });
@@ -111,7 +104,7 @@ app.post("/proxy/standing-orders", async (req, res) => {
   }
 });
 
-// ---- Daily job: create Draft Orders for today's weekday
+// ===== Daily job: create Draft Orders for today's weekday
 const DAY_KEYS = ['sun','mon','tue','wed','thu','fri','sat'];
 
 async function* iterateCustomers() {
@@ -163,7 +156,7 @@ app.post("/jobs/standing-orders/run", async (_req, res) => {
         .filter(i => i.quantity > 0);
       if (items.length === 0) continue;
       const draft = await createDraftOrder(customerId, items, `Standing order for ${dayKey.toUpperCase()}`);
-      // Optional: send invoice
+      // Optional: send invoice to customer email
       await shopify(`/draft_orders/${draft.id}/send_invoice.json`, {
         method: "POST",
         body: JSON.stringify({ draft_order_invoice: {} })
@@ -176,5 +169,6 @@ app.post("/jobs/standing-orders/run", async (_req, res) => {
   }
 });
 
+// ---- Start server
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Standing Orders backend listening on ${port}`));
