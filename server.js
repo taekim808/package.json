@@ -1,12 +1,13 @@
 // Minimal Shopify App Proxy + Standing Orders backend (ESM)
 // Comments in English only.
 
-// Import deps (ESM style, matches "type": "module" in package.json)
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
 
+// --------------------------
 // App + JSON
+// --------------------------
 const app = express();
 app.use(express.json());
 
@@ -20,19 +21,75 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, shop: process.env.SHOP || "(missing SHOP env var)" });
 });
 
-// ---- ENV + helpers
+// --------------------------
+// ENV + helpers
+// --------------------------
 const { SHOP, ADMIN_ACCESS_TOKEN, APP_PROXY_SHARED_SECRET } = process.env;
 
+// Generic fetch with retry, timeout, and exponential backoff
+async function fetchWithRetry(
+  url,
+  init = {},
+  {
+    retries = 2,          // number of retries after the first attempt (total attempts = retries + 1)
+    timeoutMs = 8000,     // per-attempt timeout
+    backoffMs = 800       // base backoff delay
+  } = {}
+) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...init, signal: controller.signal });
+
+      // Retry on 429 and 5xx. Do not retry on other non-OK codes.
+      const retryable =
+        res.status === 429 || (res.status >= 500 && res.status <= 599);
+
+      if (!res.ok && retryable && attempt < retries) {
+        // Honor Retry-After header if present
+        const ra = Number(res.headers.get("retry-after"));
+        const wait =
+          Number.isFinite(ra) && ra > 0
+            ? ra * 1000
+            : backoffMs * Math.pow(2, attempt);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+
+      // Either OK or non-retryable error
+      return res;
+    } catch (err) {
+      // AbortError or network error → retry if attempts remain
+      const isLast = attempt >= retries;
+      if (isLast) throw err;
+      const wait = backoffMs * Math.pow(2, attempt);
+      await new Promise(r => setTimeout(r, wait));
+    } finally {
+      clearTimeout(t);
+    }
+  }
+  // Should be unreachable
+  throw new Error("fetchWithRetry exhausted attempts");
+}
+
+// Shopify Admin REST call using retry wrapper
 async function shopify(path, init = {}) {
   const url = `https://${SHOP}/admin/api/2024-10${path}`;
-  const res = await fetch(url, {
-    ...init,
-    headers: {
-      "X-Shopify-Access-Token": ADMIN_ACCESS_TOKEN,
-      "Content-Type": "application/json",
-      ...(init.headers || {})
-    }
-  });
+  const res = await fetchWithRetry(
+    url,
+    {
+      ...init,
+      headers: {
+        "X-Shopify-Access-Token": ADMIN_ACCESS_TOKEN,
+        "Content-Type": "application/json",
+        ...(init.headers || {})
+      }
+    },
+    // Tune defaults if you want: more retries for Admin API calls
+    { retries: 3, timeoutMs: 10000, backoffMs: 1000 }
+  );
+
   if (!res.ok) {
     const txt = await res.text();
     throw new Error(`Shopify ${res.status} ${path}: ${txt}`);
@@ -53,7 +110,9 @@ function verifyProxy(req) {
   }
 }
 
-// ===== App Proxy: load existing standing orders for a customer
+// --------------------------
+// App Proxy: load existing standing orders for a customer
+// --------------------------
 app.get("/proxy/standing-orders", async (req, res) => {
   try {
     if (!verifyProxy(req)) return res.status(401).json({ error: "invalid signature" });
@@ -68,7 +127,9 @@ app.get("/proxy/standing-orders", async (req, res) => {
   }
 });
 
-// ===== App Proxy: save standing orders JSON for a customer
+// --------------------------
+// App Proxy: save standing orders JSON for a customer
+// --------------------------
 app.post("/proxy/standing-orders", async (req, res) => {
   try {
     if (!verifyProxy(req)) return res.status(401).json({ error: "invalid signature" });
@@ -104,18 +165,23 @@ app.post("/proxy/standing-orders", async (req, res) => {
   }
 });
 
-// ===== Daily job: create Draft Orders for today's weekday
+// --------------------------
+// Daily job: create Draft Orders for today's weekday
+// --------------------------
 const DAY_KEYS = ['sun','mon','tue','wed','thu','fri','sat'];
 
 async function* iterateCustomers() {
   let page_info = null;
   do {
     const url = page_info
-      ? `/customers.json?limit=250&page_info=${page_info}&fields=id`
-      : `/customers.json?limit=250&fields=id`;
-    const resp = await fetch(`https://${SHOP}/admin/api/2024-10${url}`, {
-      headers: { "X-Shopify-Access-Token": ADMIN_ACCESS_TOKEN }
-    });
+      ? `https://${SHOP}/admin/api/2024-10/customers.json?limit=250&page_info=${page_info}&fields=id`
+      : `https://${SHOP}/admin/api/2024-10/customers.json?limit=250&fields=id`;
+
+    const resp = await fetchWithRetry(
+      url,
+      { headers: { "X-Shopify-Access-Token": ADMIN_ACCESS_TOKEN } },
+      { retries: 3, timeoutMs: 10000, backoffMs: 1000 }
+    );
     if (!resp.ok) throw new Error(`List customers failed: ${resp.status}`);
     const link = resp.headers.get('link') || '';
     const body = await resp.json();
@@ -169,6 +235,8 @@ app.post("/jobs/standing-orders/run", async (_req, res) => {
   }
 });
 
-// ---- Start server
+// --------------------------
+// Start server
+// --------------------------
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Standing Orders backend listening on ${port}`));
