@@ -9,7 +9,13 @@ import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
 
+const express = require("express");
 const app = express();
+
+app.get("/", (_req, res) => {
+  res.send("Standing Order App backend is running ✅");
+});
+
 app.use(express.json());
 
 // ---- Helpers
